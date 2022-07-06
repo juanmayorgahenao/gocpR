@@ -1,0 +1,43 @@
+---
+title: "Update global analysis"
+author: "*Compiled on `r date()` by `r Sys.info()['user']`*"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_depth: 1
+    toc_float: yes
+    number_sections: false
+    theme: cerulean
+    highlight: haddock
+---
+
+```{r}
+library(raster)
+library(sf)
+library(tidyverse)
+
+options(scipen = 999)
+
+source("00_setup.R")
+
+load(file.path(project_dir,"data/02_processed_data/global_ranking_inputs.RData"))
+
+source(file.path(emlab_data_dir, "ocean-conservation-priorities","functions", "food_provision_foos.R"))
+source("_calculate_slopes.R")
+source("_run_prioritization.R")
+
+ocean_low_res_moll <- raster::raster(file.path(emlab_data_dir, "ocean-conservation-priorities", "inputs", "ocean_low_res_moll.tif"))
+
+land_50_moll <-  sf::st_read(file.path(emlab_data_dir, "ocean-conservation-priorities", "inputs","land_50_moll.gpkg"))
+```
+
+# Run models
+
+```{r}
+carbon_ranking <- run_prioritization(objective = "carbon", step_size = 10)
+
+food_ranking <- run_prioritization(objective = "food", step_size = 100, effort_assumption = 2)
+
+bio_ranking <- run_prioritization(objective = "carbon", step_size = 100)
+```

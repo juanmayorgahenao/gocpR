@@ -1,0 +1,583 @@
+---
+title: "Replicate global result"
+author: "*Compiled on `r date()` by `r Sys.info()['user']`*"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_depth: 1
+    toc_float: yes
+    number_sections: false
+    theme: cerulean
+    highlight: haddock
+---
+
+```{r}
+library(raster)
+library(sf)
+library(tidyverse)
+
+options(scipen = 999)
+
+source("00_setup.R")
+
+load(file.path(project_dir,"data/02_processed_data/global_ranking_inputs.RData"))
+
+source(file.path(emlab_data_dir, "ocean-conservation-priorities","functions", "food_provision_foos.R"))
+
+ocean_low_res_moll <- raster::raster(file.path(emlab_data_dir, "ocean-conservation-priorities", "inputs", "ocean_low_res_moll.tif"))
+
+land_50_moll <-  sf::st_read(file.path(emlab_data_dir, "ocean-conservation-priorities", "inputs","land_50_moll.gpkg"))
+```
+
+```{r}
+highly_mpas_raster %>% 
+  writeRaster(file.path(project_dir, "data", "02_processed_data","highly_mpas.tif"))
+```
+
+
+```{r}
+carbon_ranking <- run_prioritization(objective = "carbon", step_size = 10)
+```
+
+
+# Food model
+
+```{r}
+run_food_model <- function(effort_assumption = 2, 
+                           step_size = 100){
+  
+  ranking <- list()
+  
+  unprotected_matrix <- unprotected_matrix[,stock_names]
+  
+  current_pick <- 0
+  
+  current_state <- baseline_state[,stock_names]
+  
+  k_run <- stocks_info$k
+  
+  m_run <- stocks_info$m
+  
+  r_run <- stocks_info$r
+  
+  e_run <- stocks_info$ex_rate
+  
+  while(nrow(unprotected_matrix) > 0){
+    
+    current_pick <- sum(current_pick, 1)
+    
+    slopes <- estimate_catch_slopes(k_protected = current_state, 
+                                    e = e_run, m = m_run, r = r_run, k = k_run, effort_assumption = effort_assumption)
+    
+    delta <- unprotected_matrix%*%as.matrix(slopes)
+    
+    best_cell_indeces <- doBy::which.maxn(delta, n = step_size)
+    
+    best_cells <- delta[best_cell_indeces,] %>% 
+      enframe() %>% 
+      set_names(c('cell_id', "delta")) %>% 
+      mutate(pick_order = current_pick)
+    
+    ranking <- bind_rows(ranking, best_cells)
+    
+    current_state <- unprotected_matrix[best_cell_indeces, ,drop = F] %>% 
+      colSums() +
+      current_state
+    
+    unprotected_matrix <- unprotected_matrix[-best_cell_indeces, ,drop = F]
+    
+  }
+  
+  return(ranking)
+}
+```
+
+```{r}
+norm_features_df <- norm_features_matrix %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column("cell_id") 
+
+norm_features_df$cell_id <- as.integer(norm_features_df$cell_id)
+```
+
+```{r eval = F}
+food_ranking_a1 <- run_food_model(effort_assumption = 1,
+                                  step_size = 10)
+
+write_rds(food_ranking_a1,
+          file = file.path(project_dir, "data", "03_output_data","global_food_ranking_a1_step_10.rds"))
+
+food_ranking_a2 <- run_food_model(effort_assumption = 2, 
+                                  step_size = 10)
+
+write_rds(food_ranking_a2,
+          file = file.path(project_dir, "data", "03_output_data","global_food_ranking_a2_step_10.rds"))
+```
+
+## A2: effort redistributed entirely
+
+```{r}
+food_ranking_a1 <- read_rds("../data/global_food_ranking_a1_step_10.rds")
+
+food_ranking_a2 <- read_rds("../data/global_food_ranking_a2_step_10.rds")
+
+food_ranking_a1$cell_id <- as.integer(food_ranking_a1$cell_id)
+
+food_ranking_a2$cell_id <- as.integer(food_ranking_a2$cell_id)
+```
+
+```{r}
+build_food_curve <- function(rank_df, effort_assumption = 2){
+  
+  rank_complete <- ocean_df %>%
+    left_join(rank_df) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    left_join(norm_features_df) %>%
+    replace(is.na(.), 0)
+  
+  protection_accumulation <- rank_complete %>%
+    transmute(lon,lat, cell_id, f_highly_mpa,
+              fraction_protected = 1/n(),
+              fraction_protected =  cumsum(fraction_protected))
+  
+  benefit_accumulation <- rank_complete %>%
+    select(all_of(stock_names)) %>%
+    mutate_all(.funs = cumsum) %>%
+    apply(MARGIN = 1,
+          FUN = estimate_delta_catch,
+          e = stocks_info$ex_rate, m = stocks_info$m, r = stocks_info$r, k = stocks_info$k, 
+          effort_assumption = effort_assumption) %>%
+    t() %>%
+    as.matrix() %*% as.matrix(food_weights)  %>%
+    as_tibble() %>%
+    rowSums() %>%
+    enframe(name = NULL) %>%
+    set_names("v")
+  
+  benefit_curve <- bind_cols(protection_accumulation, benefit_accumulation)
+  
+  return(benefit_curve)
+  
+}
+```
+
+```{r}
+food_curve_a1 <- build_food_curve(rank_df = food_ranking_a1, effort_assumption = 1)
+
+food_curve_a2 <- build_food_curve(rank_df = food_ranking_a2, effort_assumption = 2)
+
+food_curves <- food_curve_a2 %>% 
+  mutate(assumption = "A2") %>% 
+  bind_rows(food_curve_a1 %>% 
+              mutate(assumption = "A1"))
+```
+
+```{r}
+food_curves %>% 
+  group_by(assumption) %>% 
+  summarize(current_mpa_v = max(v[f_highly_mpa > 0.5]),
+            max_delta_v = max(v) - current_mpa_v,
+            optimal_f_protected = min(fraction_protected[v == max(v)]),
+            delta_v_at_30p = v[which.min(abs(fraction_protected - 0.3))] - current_mpa_v,
+            f_delta_v_at_30p =  delta_v_at_30p/max_delta_v) %>% 
+  mutate_if(is.numeric,round, 3)
+```
+```{r}
+food_curves %>% 
+  mutate(v = v/10^6) %>% 
+  ggplot()+
+  geom_line(aes(fraction_protected, v, col = assumption))+
+  labs(x = "Fraction Protected",
+       y = "Change in Global Catch (Million tons)",
+       title = "Contribution to global catch")+
+  geom_rect(aes(xmin = 0,
+                  xmax = 2.6/100,
+                  ymin = 0,
+                  ymax = max(v)),
+              fill = "lightblue", alpha = 0.5)+
+    scale_x_continuous(breaks = c(0,.2,.4,.6,.8,1))+
+    easyR::ggtheme_plot()
+```
+
+
+```{r}
+food_raster_a1 <-  ocean_df %>% 
+    left_join(food_ranking_a1) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    mutate(rank = 1 - scales::rescale(base::rank(pick_order, ties.method = "first", na.last = F)),) %>%
+    select(lon, lat, rank, f_highly_mpa) %>%
+    rasterFromXYZ(crs = crs(ocean_low_res_moll)) 
+
+raster::writeRaster(food_raster_a1, 
+                    filename = file.path(project_dir, "data", "03_output_data","global_food_ranking_a1.tif"))
+
+food_raster_a2 <-  ocean_df %>% 
+    left_join(food_ranking_a2) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    mutate(rank = 1 - scales::rescale(base::rank(pick_order, ties.method = "first", na.last = F)),) %>%
+    select(lon, lat, rank, f_highly_mpa) %>%
+    rasterFromXYZ(crs = crs(ocean_low_res_moll))
+
+raster::writeRaster(food_raster_a2, 
+                    filename = file.path(project_dir, "data", "03_output_data","global_food_ranking_a2.tif"))
+```
+
+```{r}
+map_priorities <- function(ranking_raster, 
+                           projection = "+proj=moll +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs",
+                           mpas_shp = highly_mpas,
+                           land_shp = land_50_moll,
+                           caption = "Food priority. Assumption # 2"){
+  
+global_cols <- viridis::viridis(n = 8)
+
+global_breaks <- c(0, 0.3, 0.5, 0.7, 0.8, 0.85, 0.9, 0.95, 1)
+
+  prj_raster_df <- ranking_raster %>%
+    projectRaster(crs = projection, method = c("ngb"), over = T) %>%
+    as.data.frame(xy = T) %>%
+    set_names(c("lon", "lat", "rank", "f_highly_mpa")) %>%
+    filter(!is.na(rank) | f_highly_mpa > 0)
+  
+  min_mpa_local_rank <- prj_raster_df %>%
+    summarise_at(c("rank"), ~min(.x[f_highly_mpa > 0.5], na.rm = T)) %>%
+    pull(rank)
+  
+  min_mpa_local_rank <- pmin(1, min_mpa_local_rank)
+  
+  mpas_shp <- st_transform(mpas_shp, crs = projection)
+  
+  local_breaks <- sort(unique(c(global_breaks, min_mpa_local_rank)))
+  
+  local_labels <- local_breaks[-1]
+  
+  local_colors <- global_cols
+  
+  local_colors[local_labels > min_mpa_local_rank] <- "lightblue"
+  
+  #local_colors[1:4] <- viridis::viridis(n = 4)
+  
+  local_labels <- 100 - 100*local_labels
+  
+  local_labels[local_labels ==  (100-100*min_mpa_local_rank)] <- " "
+  
+  local_legend_key_widths <- tibble(to = as.numeric(as.character(local_breaks[-1])),
+                                    from = lag(to)) %>%
+    replace_na(list(from = 0)) %>%
+    mutate(range = to - from) %>%
+    mutate(w = range*0.6) %>%
+    mutate(w2 = if_else(to <= 0.8, w/1.5, w))
+
+  map <- prj_raster_df %>%
+    mutate_at(vars("rank"),
+              .funs = ~cut(.x,
+                           breaks = local_breaks,
+                           labels = local_breaks[-1],
+                           include.lowest = T)) %>%
+    replace_na(list(rank = 1)) %>%
+    ggplot(aes(x = lon, y = lat))+
+    geom_raster(aes(fill = rank), alpha = 1)+
+    geom_sf(data =  land_shp,
+            inherit.aes = F, fill = "gray", col = "transparent",linetype = 2, size = 0.5)+
+    scale_fill_manual(na.value = "black",
+                      values  = local_colors,
+                      labels = local_labels,
+                      guide = guide_legend(title = "Top % of EEZ",
+                                           direction = "horizontal",
+                                           keyheight = unit(0.01, "npc"),
+                                           keywidth = unit(rev(local_legend_key_widths$w2), "npc"),
+                                           title.position = 'top',
+                                           title.hjust = 0.5,
+                                           label.hjust = -.02,
+                                           nrow = 1,
+                                           byrow = T,
+                                           reverse = T,
+                                           label.position = "bottom"))+
+    easyR::ggtheme_map()+
+    labs(caption = caption)
+  
+  return(map) 
+  
+}
+```
+
+```{r}
+map_a1 <- map_priorities(food_raster_a1, caption = "Food priority. Assumption # 1") 
+map_a2 <- map_priorities(food_raster_a2, caption = "Food priority. Assumption # 2") 
+
+map_a2 %>% 
+  ggsave(filename = file.path(project_dir, "figures","global_food_ranking_a2.png"),
+         height = 5, width = 7)
+
+map_a1 %>% 
+  ggsave(filename = file.path(project_dir, "figures","global_food_ranking_a1.png"),
+         height = 5, width = 7)
+```
+
+# Biodiversity model
+
+```{r}
+run_bio_model <- function(step_size = 100){
+  
+  ranking <- list()
+  
+  unprotected_matrix <- unprotected_matrix[,bio_feature_names]
+  
+  current_pick <- 0
+  
+  current_state <- baseline_state[,bio_feature_names]
+  
+  while(nrow(unprotected_matrix) > 0){
+    
+    current_pick <- sum(current_pick, 1)
+    
+    slopes <- pmin(max_slopes_bio, z_bio*current_state^(z_bio - 1))
+    
+    delta <- unprotected_matrix%*%as.matrix(slopes)
+    
+    best_cell_indeces <- doBy::which.maxn(delta, n = step_size)
+    
+    best_cells <- delta[best_cell_indeces,] %>% 
+      enframe() %>% 
+      set_names(c('cell_id', "delta")) %>% 
+      mutate(pick_order = current_pick)
+    
+    ranking <- bind_rows(ranking, best_cells)
+    
+    current_state <- unprotected_matrix[best_cell_indeces, ,drop = F] %>% 
+      colSums() +
+      current_state
+    
+    unprotected_matrix <- unprotected_matrix[-best_cell_indeces, ,drop = F]
+    
+  }
+  
+  return(ranking)
+}
+```
+
+```{r}
+bio_ranking <- run_bio_model(step_size = 10)
+bio_ranking$cell_id <- as.integer(bio_ranking$cell_id)
+write_rds(bio_ranking,
+          file = file.path(project_dir, "data", "03_output_data","global_bio_ranking_step_10.rds"))
+```
+
+
+```{r}
+build_bio_curve <- function(rank_df){
+  
+  rank_complete <- ocean_df %>%
+    left_join(rank_df) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    left_join(norm_features_df) %>%
+    replace(is.na(.), 0)
+  
+  protection_accumulation <- rank_complete %>%
+    transmute(lon,lat, cell_id, f_highly_mpa,
+              fraction_protected = 1/n(),
+              fraction_protected =  cumsum(fraction_protected))
+  
+  benefit_accumulation <- rank_complete %>%
+    select(all_of(bio_feature_names)) %>%
+    mutate_all(.funs = cumsum) %>%
+    sweep(MARGIN = 2, bio_remains_BAU, `+`) %>%
+    mutate_all(.funs = ~(.)^z_bio) %>%
+    as.matrix() %*% as.matrix(bio_weights) %>%
+    as_tibble() %>%
+    set_names("v")
+  
+  benefit_curve <- bind_cols(protection_accumulation, benefit_accumulation)
+  
+  return(benefit_curve)
+  
+}
+```
+
+```{r}
+bio_curve <- build_bio_curve(bio_ranking)
+```
+
+```{r}
+bio_curve %>% 
+  summarize(current_mpa_v = max(v[f_highly_mpa > 0.5]),
+            max_delta_v = max(v) - current_mpa_v,
+            optimal_f_protected = min(fraction_protected[v == max(v)]),
+            delta_v_at_30p = v[which.min(abs(fraction_protected - 0.3))] - current_mpa_v,
+            f_delta_v_at_30p =  delta_v_at_30p/max_delta_v) %>% 
+  mutate_if(is.numeric,round, 3)
+```
+```{r}
+bio_curve %>% 
+  mutate(v = scales::rescale(v)) %>% 
+  ggplot()+
+  geom_line(aes(fraction_protected, v))+
+  labs(x = "Fraction Protected",
+       y = "Change in Global Catch (Million tons)",
+       title = "Contribution to global catch")+
+  geom_rect(aes(xmin = 0,
+                xmax = 2.6/100,
+                ymin = 0,
+                ymax = max(v)),
+            fill = "lightblue", alpha = 0.5)+
+  scale_x_continuous(breaks = c(0,.2,.4,.6,.8,1))+
+  easyR::ggtheme_plot()
+```
+
+
+```{r}
+bio_raster <-  ocean_df %>% 
+    left_join(bio_ranking) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    mutate(rank = 1 - scales::rescale(base::rank(pick_order, ties.method = "first", na.last = F)),) %>%
+    select(lon, lat, rank, f_highly_mpa) %>%
+    rasterFromXYZ(crs = crs(ocean_low_res_moll)) 
+
+raster::writeRaster(bio_raster, 
+                    filename = file.path(project_dir, "data", "03_output_data","global_bio_ranking.tif"))
+```
+
+```{r}
+bio_map <- map_priorities(bio_raster, caption = "") 
+
+bio_map %>% 
+  ggsave(filename = file.path(project_dir, "figures","global_bio_ranking.png"),
+         height = 5, width = 7)
+```
+
+# Carbon
+
+```{r}
+run_carbon_model <- function(step_size = 100, z_carbon = 1){
+  
+  ranking <- list()
+  
+  unprotected_matrix <- unprotected_matrix[,"carbon", drop = F]
+  
+  current_pick <- 0
+  
+  current_state <- baseline_state[,"carbon"]
+  
+  while(nrow(unprotected_matrix) > 0){
+    
+    current_pick <- sum(current_pick, 1)
+    
+    slopes <- pmin(max_slope_carbon, z_carbon*current_state^(z_carbon - 1))
+    
+    delta <- unprotected_matrix%*%as.matrix(slopes)
+    
+    best_cell_indeces <- doBy::which.maxn(delta, n = step_size)
+    
+    best_cells <- delta[best_cell_indeces,] %>% 
+      enframe() %>% 
+      set_names(c('cell_id', "delta")) %>% 
+      mutate(pick_order = current_pick)
+    
+    ranking <- bind_rows(ranking, best_cells)
+    
+    current_state <- unprotected_matrix[best_cell_indeces, ,drop = F] %>% 
+      colSums() +
+      current_state
+    
+    unprotected_matrix <- unprotected_matrix[-best_cell_indeces, ,drop = F]
+    
+  }
+  
+  return(ranking)
+}
+
+```
+
+```{r}
+carbon_ranking <- run_carbon_model(step_size = 10)
+
+carbon_ranking$cell_id <- as.integer(carbon_ranking$cell_id)
+
+write_rds(carbon_ranking,
+          file = file.path(project_dir, "data", "03_output_data","global_carbon_ranking_step_10.rds"))
+```
+
+```{r}
+build_carbon_curve <- function(rank_df){
+  
+  rank_complete <- ocean_df %>%
+    left_join(rank_df) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    left_join(norm_features_df) %>%
+    replace(is.na(.), 0)
+  
+  protection_accumulation <- rank_complete %>%
+    transmute(lon,lat, cell_id, f_highly_mpa,
+              fraction_protected = 1/n(),
+              fraction_protected =  cumsum(fraction_protected))
+  
+  benefit_accumulation <- rank_complete %>%
+      select(carbon) %>%
+      mutate_all(.funs = cumsum) %>%
+      sweep(MARGIN = 2, carbon_remains_BAU, `+`) %>%
+      rowSums() %>%
+      enframe(name = NULL) %>%
+      set_names("v")
+  
+  benefit_curve <- bind_cols(protection_accumulation, benefit_accumulation)
+  
+  return(benefit_curve)
+  
+}
+
+carbon_curve <- build_carbon_curve(carbon_ranking)
+```
+
+```{r}
+carbon_curve %>% 
+  summarize(current_mpa_v = max(v[f_highly_mpa > 0.5]),
+            max_delta_v = max(v) - current_mpa_v,
+            optimal_f_protected = min(fraction_protected[v == max(v)]),
+            delta_v_at_30p = v[which.min(abs(fraction_protected - 0.3))] - current_mpa_v,
+            f_delta_v_at_30p =  delta_v_at_30p/max_delta_v) %>% 
+  mutate_if(is.numeric,round, 3)
+```
+```{r}
+carbon_curve %>% 
+  mutate(v = scales::rescale(v)) %>% 
+  ggplot()+
+  geom_line(aes(fraction_protected, v))+
+  labs(x = "Fraction Protected",
+       y = "Change in Global Catch (Million tons)",
+       title = "Contribution to global catch")+
+  geom_rect(aes(xmin = 0,
+                xmax = 2.6/100,
+                ymin = 0,
+                ymax = max(v)),
+            fill = "lightblue", alpha = 0.5)+
+  scale_x_continuous(breaks = c(0,.2,.4,.6,.8,1))+
+  easyR::ggtheme_plot()
+```
+
+```{r}
+carbon_raster <-  ocean_df %>% 
+    left_join(carbon_ranking) %>%
+    replace(is.na(.), 0) %>%
+    arrange(pick_order) %>%
+    mutate(rank = 1 - scales::rescale(base::rank(pick_order, ties.method = "first", na.last = F)),) %>%
+    select(lon, lat, rank, f_highly_mpa) %>%
+    rasterFromXYZ(crs = crs(ocean_low_res_moll)) 
+
+raster::writeRaster(carbon_raster, 
+                    filename = file.path(project_dir, "data", "03_output_data","global_carbon_ranking.tif"))
+```
+
+```{r}
+carbon_map <- map_priorities(carbon_raster, caption = "") 
+
+carbon_map %>% 
+  ggsave(filename = file.path(project_dir, "figures","global_carbon_ranking.png"),
+         height = 5, width = 7)
+```

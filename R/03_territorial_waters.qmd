@@ -1,0 +1,177 @@
+---
+title: "Territorial waters"
+author: "*Compiled on `r date()` by `r Sys.info()['user']`*"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_depth: 1
+    toc_float: yes
+    number_sections: false
+    theme: cerulean
+    highlight: haddock
+---
+
+```{r}
+library(tidyverse)
+library(terra)
+library(sf)
+
+sf::sf_use_s2(FALSE)
+gocpR_dir <- "~/juanmayorga@ucsb.edu - Google Drive/Shared\ drives/emlab/projects/current-projects/gocpR/"
+```
+
+```{r}
+bio_ranking <- terra::rast(file.path(gocpR_dir, "data", "03_output_data","global_bio_ranking.tif"))[[1]]
+
+carbon_ranking <- terra::rast(file.path(gocpR_dir, "data", "03_output_data","global_carbon_ranking.tif"))[[1]]
+
+food_ranking <- terra::rast(file.path(gocpR_dir, "data", "03_output_data","global_food_ranking_a2.tif"))[[1]]
+
+territorial_wtrs <- sf::st_read("~/marine.data.science@ngs.org - Google Drive/My Drive/Pristine Seas/SCIENCE/datasets/marine-regions/eez_12nm_v3.gpkg")
+
+territorial_wtrs <- territorial_wtrs |> 
+  st_simplify(dTolerance = 0.1) |> 
+  sf::st_wrap_dateline(options = c("WRAPDATELINE=YES", 
+                                   "DATELINEOFFSET=180"), 
+                       quiet = TRUE) |> 
+  st_transform(crs = crs(bio_ranking)) |> 
+  st_make_valid()
+
+ocean_area <- terra::cellSize(bio_ranking, 
+                               mask = T, 
+                               unit = "km") |> 
+  terra::global(fun = "sum", na.rm = T) |> 
+  pull(sum)/10^6
+
+territorial_wtrs_area_km <- territorial_wtrs$AREA_KM2 |> sum()/10^6
+
+territorial_wtrs_area_km/ocean_area*100
+```
+
+# 30%
+
+```{r}
+food_ranking_30p <- ifel(food_ranking < 0.7, NA, food_ranking)
+
+bio_ranking_30p <- ifel(bio_ranking < 0.7, NA, bio_ranking)
+
+carbon_ranking_30p <- ifel(carbon_ranking < 0.7, NA, carbon_ranking)
+
+area_30p_km <- terra::cellSize(bio_ranking_30p, 
+                               mask = T, 
+                               unit = "km") |> 
+  terra::global(fun = "sum", na.rm = T) |> 
+  pull(sum)/10^6
+
+bio_extract <- bio_ranking_30p |> 
+  terra::extract(vect(territorial_wtrs), exact = T) |> 
+  filter(global_bio_ranking_1 > 0, fraction < 1) |> 
+  mutate(area_in_terri = 1*50*50,
+         area_in_terri_v2 = fraction*50*50) 
+
+food_extract <- food_ranking_30p |> 
+  terra::extract(vect(territorial_wtrs), exact = T) |> 
+  filter(global_food_ranking_a2_1 > 0, fraction < 1) |> 
+  mutate(area_in_terri = 1*50*50,
+         area_in_terri_v2 = fraction*50*50) 
+
+carbon_extract <- carbon_ranking_30p |> 
+  terra::extract(vect(territorial_wtrs), exact = T) |> 
+  filter(global_carbon_ranking_1 > 0, fraction < 1) |> 
+  mutate(area_in_terri = 1*50*50,
+         area_in_terri_v2 = fraction*50*50) 
+ 
+results_30p <- bio_extract |> 
+  summarize(priority = "biodiversity",
+            total_area_million_km2 = area_30p_km,
+            percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_30p_km,
+            percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_30p_km) |> 
+  bind_rows(
+    food_extract |> 
+      summarize(priority = "food",
+                total_area_million_km2 = area_30p_km,
+                percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_30p_km,
+                percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_30p_km)) |> 
+  bind_rows(carbon_extract |> 
+              summarize(priority = "carbon",
+                        total_area_million_km2 = area_30p_km,
+                        percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_30p_km,
+                        percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_30p_km)) |> 
+  mutate_if(is.numeric, round, 2) |> 
+  mutate(target = "30%") |> 
+  select(target, everything())
+```
+
+# 20%
+
+```{r}
+bio_ranking_20p <- ifel(bio_ranking < 0.8, NA, bio_ranking)
+
+area_20p_km <- terra::cellSize(bio_ranking_20p, 
+                               mask = T, 
+                               unit = "km") |> 
+  terra::global(fun = "sum", na.rm = T) |> 
+  pull(sum)/10^6
+
+results_20p <- bio_extract |> 
+    filter(global_bio_ranking_1 >= 0.8) |> 
+  summarize(priority = "biodiversity",
+            total_area_million_km2 = area_20p_km,
+            percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_20p_km,
+            percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_20p_km) |> 
+  bind_rows(
+    food_extract |> 
+      filter(global_food_ranking_a2_1 >= 0.8) |> 
+      summarize(priority = "food",
+                total_area_million_km2 = area_20p_km,
+                percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_20p_km,
+                percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_20p_km)) |> 
+  bind_rows(carbon_extract |> 
+              filter(global_carbon_ranking_1 >= 0.8) |> 
+              summarize(priority = "carbon",
+                        total_area_million_km2 = area_20p_km,
+                        percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_20p_km,
+                        percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_20p_km)) |> 
+  mutate_if(is.numeric, round, 2) |> 
+    mutate(target = "20%") |> 
+  select(target, everything())
+```
+
+# 10%
+
+```{r}
+bio_ranking_10p <- ifel(bio_ranking < 0.9, NA, bio_ranking)
+
+area_10p_km <- terra::cellSize(bio_ranking_10p, 
+                               mask = T, 
+                               unit = "km") |> 
+  terra::global(fun = "sum", na.rm = T) |> 
+  pull(sum)/10^6
+
+results_10p <- bio_extract |> 
+    filter(global_bio_ranking_1 >= 0.8) |> 
+  summarize(priority = "biodiversity",
+            total_area_million_km2 = area_10p_km,
+            percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_10p_km,
+            percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_10p_km) |> 
+  bind_rows(
+    food_extract |> 
+      filter(global_food_ranking_a2_1 >= 0.8) |> 
+      summarize(priority = "food",
+                total_area_million_km2 = area_10p_km,
+                percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_10p_km,
+                percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_10p_km)) |> 
+  bind_rows(carbon_extract |> 
+              filter(global_carbon_ranking_1 >= 0.8) |> 
+              summarize(priority = "carbon",
+                        total_area_million_km2 = area_10p_km,
+                        percent_coastal = 100*sum(area_in_terri, na.rm = T)/10^6/area_10p_km,
+                        percent_in_territorial_wtrs = 100*sum(area_in_terri_v2, na.rm = T)/10^6/area_10p_km)) |> 
+  mutate_if(is.numeric, round, 2) |> 
+      mutate(target = "10%") |> 
+  select(target, everything())
+
+bind_rows(results_10p, results_20p, results_30p) |> 
+  write_csv("data/territorial_waters.csv")
+```

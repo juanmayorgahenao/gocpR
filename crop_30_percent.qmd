@@ -1,0 +1,41 @@
+---
+title: "Crop 30%"
+format: html
+editor: visual
+---
+
+```{r}
+library(raster)
+library(sf)
+library(tidyverse)
+
+
+bio_ranks <- raster::raster("../../Desktop/Emlab/projects/gocpR/data-staged-for-deletion/03_output_data/global_bio_ranking.tif")
+
+carbon_ranks <- raster::raster("../../Desktop/Emlab/projects/gocpR/data-staged-for-deletion/03_output_data/global_carbon_ranking.tif")
+
+food_ranks <- raster::raster("../../Desktop/Emlab/projects/gocpR/data-staged-for-deletion/03_output_data/global_food_ranking_a2.tif")
+
+plot(food_ranks)
+```
+
+```{r}
+food_30p <- food_ranks |> 
+  raster::mask(food_ranks >= 0.7, inverse = F, maskvalue = FALSE)
+
+carbon_30p <- carbon_ranks |> 
+  raster::mask(carbon_ranks >= 0.7, inverse = F, maskvalue = FALSE)
+
+bio_30p <- bio_ranks |> 
+  raster::mask(bio_ranks >= 0.7, inverse = F, maskvalue = FALSE)
+
+writeRaster(bio_30p,
+            "../../Desktop/Emlab/projects/gocpR/data-staged-for-deletion/03_output_data/global_bio_ranking_30p.tif")
+
+writeRaster(carbon_30p,
+            "../../Desktop/Emlab/projects/gocpR/data-staged-for-deletion/03_output_data/global_carbon_ranking_30p.tif")
+
+writeRaster(food_30p,
+            "../../Desktop/Emlab/projects/gocpR/data-staged-for-deletion/03_output_data/global_food_ranking_30p.tif")
+```
+
